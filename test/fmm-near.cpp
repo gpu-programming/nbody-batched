@@ -1,5 +1,8 @@
 #include <sctl.hpp>
 #include <cassert>
+#include <numeric>
+#include <execution>
+
 #include <laplace-cuda.h>
 
 using namespace sctl;
@@ -63,12 +66,105 @@ template <int DIM, class Real> void LaplaceBatchedReference(std::vector<Real>& U
   }
 }
 
+template <Integer digits, class Real, Integer N> Vec<Real,N> approx_log(const Vec<Real,N>& x) { // TODO: vectorize
+  Vec<Real,N> logx = Vec<Real,N>::Zero();
+  for (Integer i = 0; i < N; i++) logx.insert(i, (x[i] > 0 ? sctl::log<Real>(x[i]) : 0));
+  return logx;
+}
+
+// Optimized CPU implementation
+template <int DIM, class Real, int digits=-1, int VecLen=DefaultVecLen<Real>()> void LaplaceBatchedCPU(std::vector<Real>& U, const std::vector<Real>& Xt, const std::vector<long>& trg_cnt, const std::vector<long>& trg_dsp,
+                                                      const std::vector<Real>& F, const std::vector<Real>& Xs, const std::vector<long>& src_cnt, const std::vector<long>& src_dsp,
+                                                      const std::vector<std::pair<long,long>>& trg_src_lst) {
+  using Vec = Vec<Real,VecLen>;
+  assert(trg_dsp.size() && trg_cnt.size());
+  assert((long)U.size() == *(trg_dsp.end()-1) + *(trg_cnt.end()-1));
+  #pragma omp parallel for schedule(static)
+  for (auto& u : U) u = 0;
+
+  const Long Ninterac = trg_src_lst.size();
+  std::vector<long> cost(Ninterac), cumulative_cost(Ninterac);
+  #pragma omp parallel for schedule(static)
+  for (long i = 0; i < Ninterac; i++) cost[i] = trg_cnt[trg_src_lst[i].first] * src_cnt[trg_src_lst[i].second];
+  std::exclusive_scan(std::execution::par, cost.begin(), cost.end(), cumulative_cost.begin(), (long)0);
+  const long total_cost = *(cumulative_cost.end()-1) + *(cost.end()-1);
+
+  const long Nt = trg_cnt.size();
+  std::vector<long> trg_cnt_(Nt), trg_dsp_(Nt); // padding for vectorization
+  #pragma omp parallel for schedule(static)
+  for (long i = 0; i < Nt; i++) trg_cnt_[i] = (trg_cnt[i]+VecLen-1) & ~(VecLen-1);
+  std::exclusive_scan(std::execution::par, trg_cnt_.begin(), trg_cnt_.end(), trg_dsp_.begin(), (long)0);
+  const long Ntrg = *(trg_cnt_.end()-1) + *(trg_dsp_.end()-1);
+
+  Vector<Real> Xt_(Ntrg * DIM), U_(Ntrg); // padded for vectorization
+  #pragma omp parallel for schedule(static)
+  for (long i = 0; i < Nt; i++) { // Set Xt_, U_
+    for (long j = 0; j < trg_cnt[i]; j++) {
+      U_[trg_dsp_[i]+j] = 0;
+      for (long k = 0; k < DIM; k++) {
+        Xt_[trg_dsp_[i]*DIM + k*trg_cnt_[i]+j] = Xt[(trg_dsp[i]+j)*DIM+k];
+      }
+    }
+  }
+
+  #pragma omp parallel
+  {
+    const long p = omp_get_thread_num();
+    const Long np = omp_get_max_threads();
+
+    // Partition interaction list to minimize load imbalance
+    long interac_start = std::lower_bound(cumulative_cost.begin(), cumulative_cost.end(), total_cost*(p+0)/np) - cumulative_cost.begin();
+    long interac_end   = std::lower_bound(cumulative_cost.begin(), cumulative_cost.end(), total_cost*(p+1)/np) - cumulative_cost.begin();
+
+    // Shift interac_start and interac_end to target-node boundaries
+    if (interac_start > 0) while (interac_start < Ninterac && trg_src_lst[interac_start-1].first == trg_src_lst[interac_start].first) interac_start++;
+    if (interac_end   > 0) while (interac_end   < Ninterac && trg_src_lst[interac_end  -1].first == trg_src_lst[interac_end  ].first) interac_end++;
+
+    for (long interac_idx = interac_start; interac_idx < interac_end; interac_idx++) {
+      const auto& trg_src = trg_src_lst[interac_idx];
+      const long trg_node = trg_src.first;
+      const long src_node = trg_src.second;
+      const long trg_offset = trg_dsp_[trg_node];
+      const long src_offset = src_dsp[src_node];
+      const long Nt = trg_cnt_[trg_node];
+      const long Ns = src_cnt[src_node];
+
+      for (long t = 0; t < Nt; t+=VecLen) {
+        Vec Xt[DIM];
+        for (Long k = 0; k < DIM; k++) Xt[k] = Vec::LoadAligned(&*Xt_.begin() + trg_offset*DIM + k*Nt + t);
+        Vec U = Vec::LoadAligned(&*U_.begin() + trg_offset + t);
+        for (long s = 0; s < Ns; s++) {
+          Vec r2 = Vec::Zero();
+          for (long k = 0; k < DIM; k++) {
+            const Vec dx = Xt[k] - Xs[(src_offset+s)*DIM+k];
+            r2 += dx * dx;
+          }
+          //if (r2 > 0) {
+            if (DIM == 2) {
+              U += F[src_offset+s] * approx_log<digits>(r2) * 0.5;
+            } else if (DIM == 3) {
+              U += F[src_offset+s] * approx_rsqrt<digits>(r2, r2 > Vec::Zero());
+            }
+          //}
+        }
+        U.StoreAligned(&*U_.begin() + trg_offset + t);
+      }
+
+      Profile::Add_FLOP(Ns*Nt*(3*DIM+3));
+    }
+  }
+
+  #pragma omp parallel for schedule(static)
+  for (long i = 0; i < Nt; i++) {
+    for (long j = 0; j < trg_cnt[i]; j++) {
+      U[trg_dsp[i]+j] = U_[trg_dsp_[i]+j];
+    }
+  }
+}
+
 template <int DIM, class Real> void LaplaceBatchedGPU(std::vector<Real>& U, const std::vector<Real>& Xt, const std::vector<long>& trg_cnt, const std::vector<long>& trg_dsp,
                                                 const std::vector<Real>& F, const std::vector<Real>& Xs, const std::vector<long>& src_cnt, const std::vector<long>& src_dsp,
-                                                const std::vector<std::pair<long,long>>& trg_src_lst) {
-  // TODO
-  //LaplaceBatchedCUDA<DIM>(U, Xt, trg_cnt, trg_dsp, F, Xs, src_cnt, src_dsp, trg_src_lst);
-}
+                                                const std::vector<std::pair<long,long>>& trg_src_lst);
 
 /**
  * Compute N-body near interactions.
@@ -184,24 +280,38 @@ template <class Real, int DIM> void nbody_near(const long N_, const long M, cons
     }
   }
 
+  const auto print_error = [&comm](const std::vector<Real>& U0, const std::vector<Real>& U) {
+    StaticArray<Real,2> global_max, local_max{0,0};
+    for (const auto& x : Vector<Real>(U0)-Vector<Real>(U)) local_max[0] = std::max<Real>(local_max[0], fabs(x));
+    for (const auto& x : U0) local_max[1] = std::max<Real>(local_max[1], fabs(x));
+    comm.Allreduce(local_max+0, global_max+0, 2, Comm::CommOp::MAX);
+    if (!comm.Rank()) std::cout<<"Relative error = "<<global_max[0]/global_max[1]<<'\n';
+  };
   const long Nt = omp_par::reduce(pt_cnt.begin(), pt_cnt.size());
   std::vector<Real> U0(Nt), U(Nt);
+
   for (auto& a : U0) a = 0;
+  Profile::Tic("CPU", &comm, false);
+  //LaplaceBatchedReference<DIM>(U0, X, pt_cnt, pt_dsp, F, X, pt_cnt, pt_dsp, trg_src_lst);
+  LaplaceBatchedCPU<DIM>(U0, X, pt_cnt, pt_dsp, F, X, pt_cnt, pt_dsp, trg_src_lst);
+  Profile::Toc();
+
+  #ifdef HAVE_CUDA
   for (auto& a : U) a = 0;
-
-  Profile::Tic("CPU", &comm, true);
-  LaplaceBatchedReference<DIM>(U0, X, pt_cnt, pt_dsp, F, X, pt_cnt, pt_dsp, trg_src_lst);
+  DeviceSynchronizeCUDA();
+  Profile::Tic("GPU (CUDA)", &comm, false);
+  LaplaceBatchedCUDA<DIM>(U, X, pt_cnt, pt_dsp, F, X, pt_cnt, pt_dsp, trg_src_lst);
   Profile::Toc();
+  print_error(U0, U);
+  #endif
 
-  Profile::Tic("GPU", &comm, true);
-  LaplaceBatchedGPU<DIM>(U, X, pt_cnt, pt_dsp, F, X, pt_cnt, pt_dsp, trg_src_lst);
-  Profile::Toc();
+  // Add other GPU implementation below:
 
-  StaticArray<Real,2> global_max, local_max{0,0};
-  for (const auto& x : Vector<Real>(U0)-Vector<Real>(U)) local_max[0] = std::max<Real>(local_max[0], fabs(x));
-  for (const auto& x : U0) local_max[1] = std::max<Real>(local_max[1], fabs(x));
-  comm.Allreduce(local_max+0, global_max+0, 2, Comm::CommOp::MAX);
-  if (!comm.Rank()) std::cout<<"Relative error = "<<global_max[0]/global_max[1]<<'\n';
+  //for (auto& a : U) a = 0;
+  //Profile::Tic("GPU", &comm, false);
+  //LaplaceBatchedGPU<DIM>(U, X, pt_cnt, pt_dsp, F, X, pt_cnt, pt_dsp, trg_src_lst);
+  //Profile::Toc();
+  //print_error(U0, U);
 
   if (0) { // Generate visualization
     tree.AddParticleData("potential", "pt", Vector<Real>());
@@ -225,12 +335,20 @@ int main(int argc, char** argv) {
   {
     const Comm& comm = Comm::World();
 
-    Profile::Tic("2D", &comm, true);
+    Profile::Tic("2D (N=1e7, M=1e3)", &comm, true);
     nbody_near<double,2>(1000000, 1000, comm);
     Profile::Toc();
 
-    Profile::Tic("3D", &comm, true);
+    Profile::Tic("2D (N=1e7, M=1e4)", &comm, true);
+    nbody_near<double,2>(1000000, 10000, comm);
+    Profile::Toc();
+
+    Profile::Tic("3D (N=1e7, M=1e3)", &comm, true);
     nbody_near<double,3>(1000000, 1000, comm);
+    Profile::Toc();
+
+    Profile::Tic("3D (N=1e7, M=1e4)", &comm, true);
+    nbody_near<double,3>(1000000, 10000, comm);
     Profile::Toc();
 
     Profile::print(&comm);

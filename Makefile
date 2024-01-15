@@ -1,11 +1,15 @@
 SCTL_INCDIR = ./SCTL/include/
-ENABLE_CUDA ?= 0
+ENABLE_CUDA ?= 1
+ENABLE_MPI ?= 0
 
 CXX = g++ # requires g++-8 or newer / icpc (with gcc compatibility 7.5 or newer) / clang++ with llvm-10 or newer
-CXXFLAGS = -std=c++11 -fopenmp -Wall -Wfloat-conversion # need C++11 and OpenMP
+CXXFLAGS = -std=c++17 -fopenmp -Wall -Wfloat-conversion # need C++11 and OpenMP
 
-NVCC = nvcc
-NVCCFLAGS = -Xptxas -v -Xcompiler -fopenmp --gpu-architecture=compute_80 --gpu-code=sm_80
+NVCC = nvcc -O3
+NVCCFLAGS = -Xcompiler -fopenmp -Xptxas -v -Xptxas -O3
+NVCCFLAGS += -gencode arch=compute_70,code=sm_70
+NVCCFLAGS += -gencode arch=compute_80,code=sm_80
+NVCCFLAGS += -gencode arch=compute_90,code=sm_90
 CUDA_LIBS += -L$(CUDA_ROOT)/lib64/ -lcudart
 
 DEBUG ?= 0
@@ -24,7 +28,9 @@ else
 endif
 
 CXXFLAGS += -DSCTL_PROFILE=5 -DSCTL_VERBOSE # Enable profiling
-#CXXFLAGS += -DSCTL_HAVE_MPI #use MPI
+ifeq ($(ENABLE_MPI), 1)
+	CXXFLAGS += -DSCTL_HAVE_MPI #use MPI
+endif
 
 
 RM = rm -f
@@ -43,6 +49,7 @@ ifeq ($(ENABLE_CUDA), 1)
 	SOURCES += $(wildcard $(SRCDIR)/*.cu)
 	OBJECTS += $(filter %.o, $(SOURCES:$(SRCDIR)/%.cu=$(OBJDIR)/%.o))
 	LDLIBS += $(CUDA_LIBS)
+	CXXFLAGS += -DHAVE_CUDA
 endif
 
 TARGET_BIN = \
