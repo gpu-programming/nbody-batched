@@ -61,7 +61,7 @@ template <int DIM, class Real> void LaplaceBatchedReference(std::vector<Real>& U
       }
     }
 
-    Profile::Add_FLOP(Ns*Nt*(3*DIM+3));
+    Profile::IncrementCounter(ProfileCounter::FLOP, Ns*Nt*(3*DIM+3));
 
   }
 }
@@ -73,8 +73,8 @@ template <Integer digits, class Real, Integer N> Vec<Real,N> approx_log(const Ve
 }
 
 // Optimized CPU implementation
-template <int DIM, class Real, int digits=-1, int VecLen=DefaultVecLen<Real>()> void LaplaceBatchedCPU(std::vector<Real>& U, const std::vector<Real>& Xt, const std::vector<long>& trg_cnt, const std::vector<long>& trg_dsp,
-                                                      const std::vector<Real>& F, const std::vector<Real>& Xs, const std::vector<long>& src_cnt, const std::vector<long>& src_dsp,
+template <int DIM, class Real, int digits=-1, int VecLen=DefaultVecLen<Real>()> void LaplaceBatchedCPU(std::vector<Real>& U, const std::vector<Real>& Xt, const std::vector<Long>& trg_cnt, const std::vector<Long>& trg_dsp,
+                                                      const std::vector<Real>& F, const std::vector<Real>& Xs, const std::vector<Long>& src_cnt, const std::vector<Long>& src_dsp,
                                                       const std::vector<std::pair<long,long>>& trg_src_lst) {
   using Vec = Vec<Real,VecLen>;
   assert(trg_dsp.size() && trg_cnt.size());
@@ -150,7 +150,7 @@ template <int DIM, class Real, int digits=-1, int VecLen=DefaultVecLen<Real>()> 
         U.StoreAligned(&*U_.begin() + trg_offset + t);
       }
 
-      Profile::Add_FLOP(Ns*Nt*(3*DIM+3));
+      Profile::IncrementCounter(ProfileCounter::FLOP, Ns*Nt*(3*DIM+3));
     }
   }
 
@@ -190,13 +190,13 @@ template <class Real, int DIM> void nbody_near(const long N_, const long M, cons
 
     tree.AddParticles("pt", X);
     tree.AddParticleData("density", "pt", f);
-    tree.UpdateRefinement(X, M, true, false);
+    tree.UpdateRefinement(X, M, true, false, 0);
     tree.template Broadcast<Real>("pt");
     tree.template Broadcast<Real>("density");
   }
 
   std::vector<Real> F, X;
-  std::vector<long> pt_cnt, pt_dsp;
+  std::vector<Long> pt_cnt, pt_dsp;
   { // Set F, X, pt_cnt, pt_dsp
     Vector<Real> F_, X_;
     Vector<Long> cnt;
@@ -284,7 +284,7 @@ template <class Real, int DIM> void nbody_near(const long N_, const long M, cons
     StaticArray<Real,2> global_max, local_max{0,0};
     for (const auto& x : Vector<Real>(U0)-Vector<Real>(U)) local_max[0] = std::max<Real>(local_max[0], fabs(x));
     for (const auto& x : U0) local_max[1] = std::max<Real>(local_max[1], fabs(x));
-    comm.Allreduce(local_max+0, global_max+0, 2, Comm::CommOp::MAX);
+    comm.Allreduce(local_max+0, global_max+0, 2, CommOp::MAX);
     if (!comm.Rank()) std::cout<<"Relative error = "<<global_max[0]/global_max[1]<<'\n';
   };
   const long Nt = omp_par::reduce(pt_cnt.begin(), pt_cnt.size());
