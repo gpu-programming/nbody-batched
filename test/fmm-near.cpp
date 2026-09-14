@@ -190,9 +190,9 @@ template <class Real, int DIM> void nbody_near(const long N_, const long M, cons
 
     tree.AddParticles("pt", X);
     tree.AddParticleData("density", "pt", f);
-    tree.UpdateRefinement(X, M, true, false, 0);
-    tree.template Broadcast<Real>("pt");
-    tree.template Broadcast<Real>("density");
+    tree.UpdateRefinement(X, M, true, sctl::Periodicity::NONE, 0);
+    tree.Broadcast("pt");
+    tree.Broadcast("density");
   }
 
   std::vector<Real> F, X;
